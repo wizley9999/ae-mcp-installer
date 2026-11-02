@@ -128,8 +128,20 @@ function Get-NodeMajor {
 function Get-PrefFiles {
     $base = Join-Path $env:APPDATA 'Adobe\After Effects'
     if (-not (Test-Path -LiteralPath $base)) { return @() }
-    @(Get-ChildItem -LiteralPath $base -Recurse -Filter '*.txt' -ErrorAction SilentlyContinue |
+    $majors = @(Get-AEInstalls | ForEach-Object { $_.Year - 2000 })
+    @(Get-ChildItem -LiteralPath $base -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^(\d+)\.' -and ([int]$Matches[1] -in $majors) } |
+        ForEach-Object { Get-ChildItem -LiteralPath $_.FullName -Recurse -Filter '*.txt' -ErrorAction SilentlyContinue } |
         Where-Object { Select-String -LiteralPath $_.FullName -SimpleMatch "`"$PrefKey`"" -Quiet })
+}
+
+function Read-TextFile([string]$Path) {
+    $encoding = Get-FileEncoding ([IO.File]::ReadAllBytes($Path))
+    [pscustomobject]@{ Text = [IO.File]::ReadAllText($Path, $encoding); Encoding = $encoding }
+}
+
+function Test-PrefEnabled([string]$Text) {
+    $Text -match "`"$PrefKey`"\s*=\s*(`"0*1`"|0*1\b)"
 }
 
 function Get-ClaudeDesktopExe {
@@ -359,17 +371,28 @@ function Enable-ScriptingPref {
     $closed = Wait-ForClose 'After Effects' { Get-AEProcesses } 'Save your work and close it so its preferences can be changed.'
     if (-not $closed) { Show-ManualPrefHelp; return $false }
 
+    $allOn = $true
     foreach ($f in $files) {
-        $bytes = [IO.File]::ReadAllBytes($f.FullName)
-        $encoding = Get-FileEncoding $bytes
-        $text = [IO.File]::ReadAllText($f.FullName, $encoding)
-        $new = [regex]::Replace($text, "(`"$PrefKey`"\s*=\s*)\d+", '${1}01')
-        if ($new -eq $text) { Ok "Already enabled ($($f.Directory.Name))"; continue }
+        $label = $f.Directory.Name
+        $file = Read-TextFile $f.FullName
+        if (Test-PrefEnabled $file.Text) { Ok "Already enabled ($label)"; continue }
+
+        $new = [regex]::Replace($file.Text, "(`"$PrefKey`"\s*=\s*)`"\d+`"", '${1}"1"')
+        $new = [regex]::Replace($new, "(`"$PrefKey`"\s*=\s*)\d+", '${1}01')
+        if (-not (Test-PrefEnabled $new)) {
+            Warn "Unrecognized preferences format, could not enable ($label)"
+            $allOn = $false
+            continue
+        }
+
         if (-not (Test-Path -LiteralPath "$($f.FullName).bak")) { Copy-Item -LiteralPath $f.FullName -Destination "$($f.FullName).bak" }
-        [IO.File]::WriteAllText($f.FullName, $new, $encoding)
-        Ok "Enabled ($($f.Directory.Name), backup: $($f.Name).bak)"
+        [IO.File]::WriteAllText($f.FullName, $new, $file.Encoding)
+
+        if (Test-PrefEnabled (Read-TextFile $f.FullName).Text) { Ok "Enabled ($label, backup: $($f.Name).bak)" }
+        else { Warn "Failed to enable ($label)"; $allOn = $false }
     }
-    return $true
+    if (-not $allOn) { Show-ManualPrefHelp }
+    return $allOn
 }
 
 function Set-ClaudeConfig([string]$Path, [string]$NodeExe, [string]$Entry) {
@@ -446,7 +469,7 @@ function Invoke-Doctor {
     $prefs = @(Get-PrefFiles)
     if ($prefs.Count -eq 0) { Warn 'AE scripting permission: could not verify (check it in After Effects)' }
     foreach ($f in $prefs) {
-        $on = Select-String -LiteralPath $f.FullName -Pattern "`"$PrefKey`"\s*=\s*0*1\b" -Quiet
+        $on = Test-PrefEnabled (Read-TextFile $f.FullName).Text
         Check $on "AE scripting permission enabled ($($f.Directory.Name))" "AE scripting permission disabled ($($f.Directory.Name))"
     }
 
